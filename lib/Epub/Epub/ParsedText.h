@@ -67,4 +67,8 @@ class ParsedText {
   void layoutAndExtractLines(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
                              bool includeLastLine = true);
+  // Measures the text without consuming it: naturalWidth is the single-line width
+  // (all words plus inter-word spaces), maxWordWidth is the widest single token.
+  // Used by table layout to derive column widths from cell content.
+  void measureIntrinsicWidths(const GfxRenderer& renderer, int fontId, int& naturalWidth, int& maxWordWidth) const;
 };

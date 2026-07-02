@@ -533,6 +533,34 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   }
 }
 
+void ParsedText::measureIntrinsicWidths(const GfxRenderer& renderer, const int fontId, int& naturalWidth,
+                                        int& maxWordWidth) const {
+  naturalWidth = 0;
+  maxWordWidth = 0;
+  if (words.empty()) {
+    return;
+  }
+
+  // SD card fonts need glyph advances loaded before measuring (no-op for flash fonts).
+  if (renderer.isSdCardFont(fontId)) {
+    uint8_t styleMask = 0;
+    for (auto s : wordStyles) {
+      styleMask |= static_cast<uint8_t>(1u << (static_cast<uint8_t>(s) & 0x03));
+    }
+    if (styleMask == 0) styleMask = 0x01;
+    renderer.ensureSdCardFontReady(fontId, words, false, styleMask);
+  }
+
+  for (size_t i = 0; i < words.size(); ++i) {
+    const int width = measureWordWidth(renderer, fontId, words[i], wordStyles[i]);
+    maxWordWidth = std::max(maxWordWidth, width);
+    naturalWidth += width;
+    if (i > 0 && !wordContinues[i] && !wordNoSpaceBefore[i]) {
+      naturalWidth += renderer.getSpaceWidth(fontId, wordStyles[i - 1]);
+    }
+  }
+}
+
 std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& renderer, const int fontId) {
   std::vector<uint16_t> wordWidths;
   wordWidths.reserve(words.size());
