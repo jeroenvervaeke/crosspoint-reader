@@ -108,6 +108,8 @@ Version 29 includes:
 - serialized word style bits for underline, strikethrough, superscript, and
   subscript
 - `TAG_PageRect` filled-rectangle elements used for table cell borders
+- character-level word breaking in narrow table cells (affects laid-out page
+  contents, so v28 caches are regenerated)
 
 ImHex pattern:
 

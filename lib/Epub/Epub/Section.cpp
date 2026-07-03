@@ -10,7 +10,8 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-// v29: adds TAG_PageRect page elements (table cell borders).
+// v29: adds TAG_PageRect page elements (table cell borders); narrow table cells
+// character-break words that no hyphenation pattern splits narrowly enough.
 constexpr uint8_t SECTION_FILE_VERSION = 29;
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
