@@ -18,11 +18,27 @@ TableLayout::TableLayout(const GfxRenderer& renderer, const int fontId, const fl
   bufferedRows.reserve(SAMPLE_ROW_LIMIT);
 }
 
+BlockStyle TableLayout::cellBlockStyle(const bool isHeaderCell, const CssStyle& cssStyle) {
+  BlockStyle style;
+  style.textAlignDefined = true;
+  style.alignment =
+      cssStyle.hasTextAlign() ? cssStyle.textAlign : (isHeaderCell ? CssTextAlign::Center : CssTextAlign::Left);
+  // Suppress the paragraph first-line indent inside cells.
+  style.textIndentDefined = true;
+  style.textIndent = 0;
+  if (cssStyle.hasDirection()) {
+    style.directionDefined = true;
+    style.isRtl = cssStyle.direction == CssTextDirection::Rtl;
+  }
+  return style;
+}
+
 void TableLayout::startRow() {
   rowOpen = true;
   cellOpen = false;
   currentRowCols = 0;
   currentRow.clear();
+  currentRow.reserve(MAX_COLS);
 }
 
 bool TableLayout::startCell(const uint8_t colSpan) {
@@ -31,10 +47,12 @@ bool TableLayout::startCell(const uint8_t colSpan) {
     startRow();
   }
   if (cellOpen || currentRowCols >= MAX_COLS) {
+    LOG_DBG("TBL", "Dropping table cell beyond column cap (%u)", static_cast<unsigned>(MAX_COLS));
     return false;
   }
   if (layoutDecided && useColumns && currentRowCols >= columnWidths.size()) {
     // Row is wider than the sampled column count; extra cells are dropped.
+    LOG_DBG("TBL", "Dropping table cell beyond sampled column count (%u)", static_cast<unsigned>(columnWidths.size()));
     return false;
   }
   cellOpen = true;
@@ -218,17 +236,19 @@ void TableLayout::addRect(TablePageSink& sink, const int16_t x, const int16_t y,
   sink.addElement(std::move(rect));
 }
 
-void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
-  const size_t numCols = columnWidths.size();
-  const int16_t pageH = sink.pageHeight();
+// UTF-8 for U+2026 HORIZONTAL ELLIPSIS, appended where cell content is truncated.
+constexpr const char* TRUNCATION_ELLIPSIS = "\xE2\x80\xA6";
 
-  // Lay out every cell into lines at its content width.
-  std::vector<std::vector<std::shared_ptr<TextBlock>>> cellLines;
-  std::vector<int16_t> cellX;
-  cellLines.reserve(row.size());
-  cellX.reserve(row.size());
+size_t TableLayout::layoutRowCells(Row& row) {
+  const size_t numCols = columnWidths.size();
+
+  rowCellLines.clear();
+  rowCellX.clear();
+  rowBoundaries.clear();
+  rowCellLines.reserve(row.size());
+  rowCellX.reserve(row.size());
   // Border lines running through a colspan cell are suppressed.
-  std::vector<bool> boundarySkipped(numCols + 1, false);
+  rowBoundarySkipped.assign(numCols + 1, false);
 
   size_t col = 0;
   size_t rowLines = 1;  // empty rows still get one line of height
@@ -242,13 +262,22 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
     }
     if (contentWidth < 1) contentWidth = 1;
     for (size_t b = col + 1; b < col + span; ++b) {
-      boundarySkipped[b] = true;
+      rowBoundarySkipped[b] = true;
     }
 
-    cellX.push_back(static_cast<int16_t>(boundaryXs[col] + BORDER + CELL_PAD_X));
-    cellLines.emplace_back();
-    auto& lines = cellLines.back();
+    rowCellX.push_back(static_cast<int16_t>(boundaryXs[col] + BORDER + CELL_PAD_X));
+    rowCellLines.emplace_back();
+    auto& lines = rowCellLines.back();
     if (cell.text && !cell.text->isEmpty()) {
+      // All of a row's lines are alive at once below, so bound the row's total
+      // words; spanning cells get a proportionally larger share.
+      const size_t cellBudget = std::max<size_t>(1, ROW_WORD_BUDGET * span / numCols);
+      if (cell.text->size() > cellBudget) {
+        LOG_DBG("TBL", "Truncating table cell to %u words", static_cast<unsigned>(cellBudget));
+        cell.text->truncateWords(cellBudget);
+        cell.text->addWord(TRUNCATION_ELLIPSIS, EpdFontFamily::REGULAR);
+      }
+      lines.reserve(cell.text->size());
       cell.text->layoutAndExtractLines(renderer, fontId, static_cast<uint16_t>(contentWidth),
                                        [&lines](const std::shared_ptr<TextBlock>& line) { lines.push_back(line); });
     }
@@ -258,13 +287,19 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
   }
 
   // Vertical border x positions relevant for this row.
-  std::vector<int16_t> rowBoundaries;
   rowBoundaries.reserve(numCols + 1);
   for (size_t b = 0; b <= numCols; ++b) {
-    if (!boundarySkipped[b]) {
+    if (!rowBoundarySkipped[b]) {
       rowBoundaries.push_back(boundaryXs[b]);
     }
   }
+
+  return rowLines;
+}
+
+void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
+  const int16_t pageH = sink.pageHeight();
+  const size_t rowLines = layoutRowCells(row);
 
   // Pre-flight: make sure the row can open on this page with at least one text
   // line plus its closing padding and border; otherwise start a fresh page.
@@ -273,7 +308,8 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
   }
   {
     const int16_t y = sink.currentY();
-    const int16_t opening = (topBorderPending ? BORDER : 0) + CELL_PAD_Y + lineHeight + CELL_PAD_Y + BORDER;
+    const auto opening =
+        static_cast<int16_t>((topBorderPending ? BORDER : 0) + CELL_PAD_Y + lineHeight + CELL_PAD_Y + BORDER);
     if (y > 0 && y + opening > pageH) {
       sink.completePage();
     }
@@ -305,18 +341,19 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
       closing = false;
     }
     if (fit == 0) {
-      // Degenerate viewport (a single line doesn't fit an empty page): force out
-      // whatever remains rather than looping forever.
-      fit = remaining;
+      // Degenerate page (shorter than one text line): emit a single line and
+      // drop the rest of the row rather than looping or overflowing the
+      // int16 geometry below with an unbounded forced fit.
+      fit = 1;
       closing = true;
     }
 
-    for (size_t i = 0; i < cellLines.size(); ++i) {
-      const auto& lines = cellLines[i];
+    for (size_t i = 0; i < rowCellLines.size(); ++i) {
+      const auto& lines = rowCellLines[i];
       const size_t end = std::min(lines.size(), emitted + fit);
       for (size_t k = emitted; k < end; ++k) {
         auto line = std::shared_ptr<PageLine>(new (std::nothrow) PageLine(
-            lines[k], cellX[i], static_cast<int16_t>(contentY + (k - emitted) * lineHeight)));
+            lines[k], rowCellX[i], static_cast<int16_t>(contentY + (k - emitted) * lineHeight)));
         if (!line) {
           LOG_ERR("TBL", "OOM: PageLine");
           continue;
@@ -334,7 +371,7 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
       }
       addRect(sink, tableX, rowBottom, totalWidth, BORDER);
       sink.advanceY(static_cast<int16_t>(rowBottom + BORDER - sink.currentY()));
-      return;
+      break;
     }
 
     // Row continues on the next page: extend this segment's verticals to the
@@ -346,6 +383,10 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
     emitted += fit;
     firstSegment = false;
   }
+
+  // Release this row's line references promptly (the emitted PageLines hold
+  // their own); capacity is retained for the next row.
+  rowCellLines.clear();
 }
 
 void TableLayout::emitRowStacked(Row& row, TablePageSink& sink) {

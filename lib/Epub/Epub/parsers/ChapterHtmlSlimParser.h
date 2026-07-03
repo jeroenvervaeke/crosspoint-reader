@@ -77,6 +77,10 @@ class ChapterHtmlSlimParser : private TablePageSink {
   CssTextDirection effectiveDirection = CssTextDirection::Ltr;
   bool effectiveSup = false;
   bool effectiveSub = false;
+  // Invariants: tableLayout is non-null iff tableDepth >= 1 (a failed TableLayout
+  // allocation skips the whole table subtree and leaves tableDepth at 0), and
+  // inTableCell implies tableLayout is non-null. While tableDepth == 1 and no cell
+  // is open, currentTextBlock may be null; it is restored when the table closes.
   int tableDepth = 0;
   bool inTableCell = false;
   std::unique_ptr<TableLayout> tableLayout;

@@ -487,25 +487,22 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
       blockStyle.alignment == CssTextAlign::Justify ||
       (blockStyle.isRtl ? blockStyle.alignment == CssTextAlign::Right : blockStyle.alignment == CssTextAlign::Left);
 
-  // Ensure SD card font glyph metrics are loaded before measuring word widths.
-  // For flash-based fonts isSdCardFont() returns false and this block is skipped
-  // entirely — no heap allocation. For SD card fonts this reads glyph metadata
-  // (advanceX only, no bitmaps) for all unique codepoints in this paragraph so
-  // that calculateWordWidths() can measure text without on-demand SD I/O.
-  if (renderer.isSdCardFont(fontId)) {
-    // Style mask: only ask the SD font to load advances for styles actually
-    // used in this paragraph. Style index is the low two bits (regular/bold/
-    // italic/bold-italic); the underline bit is irrelevant to advance metrics.
-    uint8_t styleMask = 0;
-    for (auto s : wordStyles) {
-      styleMask |= static_cast<uint8_t>(1u << (static_cast<uint8_t>(s) & 0x03));
-    }
-    if (styleMask == 0) styleMask = 0x01;  // defensive: regular only
-    renderer.ensureSdCardFontReady(fontId, words, hyphenationEnabled, styleMask);
-  }
-
+  // Reuse the widths measured by measureIntrinsicWidths when they are still in
+  // lockstep with words (table cell layout measures first for column sizing);
+  // otherwise measure now. ensureFontMetricsLoaded reads SD card font glyph
+  // metadata (advanceX only, no bitmaps) for all unique codepoints in this
+  // paragraph so measuring does not fall back to on-demand SD I/O; it is a
+  // no-op for flash fonts and was already done by measureIntrinsicWidths when
+  // the cache is valid.
   const int pageWidth = viewportWidth;
-  auto wordWidths = calculateWordWidths(renderer, fontId);
+  std::vector<uint16_t> wordWidths;
+  if (cachedWordWidths.size() == words.size()) {
+    wordWidths = std::move(cachedWordWidths);
+  } else {
+    ensureFontMetricsLoaded(renderer, fontId);
+    wordWidths = calculateWordWidths(renderer, fontId);
+  }
+  cachedWordWidths.clear();
 
   std::vector<size_t> lineBreakIndices;
   if (hyphenationEnabled) {
@@ -533,32 +530,57 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   }
 }
 
+// Loads SD card font glyph advances for all words in this block (no-op for flash
+// fonts). Must run before any width measurement so measuring does not trigger
+// per-glyph on-demand SD reads.
+void ParsedText::ensureFontMetricsLoaded(const GfxRenderer& renderer, const int fontId) const {
+  if (!renderer.isSdCardFont(fontId)) {
+    return;
+  }
+  // Style mask: only ask the SD font to load advances for styles actually used
+  // in this block. Style index is the low two bits (regular/bold/italic/
+  // bold-italic); the underline bit is irrelevant to advance metrics.
+  uint8_t styleMask = 0;
+  for (auto s : wordStyles) {
+    styleMask |= static_cast<uint8_t>(1u << (static_cast<uint8_t>(s) & 0x03));
+  }
+  if (styleMask == 0) styleMask = 0x01;  // defensive: regular only
+  renderer.ensureSdCardFontReady(fontId, words, hyphenationEnabled, styleMask);
+}
+
 void ParsedText::measureIntrinsicWidths(const GfxRenderer& renderer, const int fontId, int& naturalWidth,
-                                        int& maxWordWidth) const {
+                                        int& maxWordWidth) {
   naturalWidth = 0;
   maxWordWidth = 0;
+  cachedWordWidths.clear();
   if (words.empty()) {
     return;
   }
 
-  // SD card fonts need glyph advances loaded before measuring (no-op for flash fonts).
-  if (renderer.isSdCardFont(fontId)) {
-    uint8_t styleMask = 0;
-    for (auto s : wordStyles) {
-      styleMask |= static_cast<uint8_t>(1u << (static_cast<uint8_t>(s) & 0x03));
-    }
-    if (styleMask == 0) styleMask = 0x01;
-    renderer.ensureSdCardFontReady(fontId, words, false, styleMask);
-  }
+  ensureFontMetricsLoaded(renderer, fontId);
 
+  cachedWordWidths.reserve(words.size());
   for (size_t i = 0; i < words.size(); ++i) {
     const int width = measureWordWidth(renderer, fontId, words[i], wordStyles[i]);
+    cachedWordWidths.push_back(static_cast<uint16_t>(width));
     maxWordWidth = std::max(maxWordWidth, width);
     naturalWidth += width;
     if (i > 0 && !wordContinues[i] && !wordNoSpaceBefore[i]) {
       naturalWidth += renderer.getSpaceWidth(fontId, wordStyles[i - 1]);
     }
   }
+}
+
+void ParsedText::truncateWords(const size_t maxWords) {
+  if (words.size() <= maxWords) {
+    return;
+  }
+  words.resize(maxWords);
+  wordStyles.resize(maxWords);
+  wordContinues.resize(maxWords);
+  wordNoSpaceBefore.resize(maxWords);
+  wordIsFocusSuffix.resize(maxWords);
+  cachedWordWidths.clear();
 }
 
 std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& renderer, const int fontId) {
