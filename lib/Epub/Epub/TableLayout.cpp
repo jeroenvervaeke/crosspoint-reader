@@ -36,73 +36,147 @@ BlockStyle TableLayout::cellBlockStyle(const bool isHeaderCell, const CssStyle& 
 void TableLayout::startRow() {
   rowOpen = true;
   cellOpen = false;
+  openCellStreamed = false;
+  currentRowStacked = false;
+  stackedRowHadContent = false;
   currentRowCols = 0;
+  currentRowWords = 0;
   currentRow.clear();
   currentRow.reserve(MAX_COLS);
 }
 
-bool TableLayout::startCell(const uint8_t colSpan) {
+bool TableLayout::startCell(const uint8_t colSpan, TablePageSink& sink) {
   if (!rowOpen) {
     // Malformed HTML (<td> without <tr>): open an implicit row instead of losing content.
     startRow();
   }
-  if (cellOpen || currentRowCols >= MAX_COLS) {
-    LOG_DBG("TBL", "Dropping table cell beyond column cap (%u)", static_cast<unsigned>(MAX_COLS));
-    return false;
+  if (cellOpen) {
+    return false;  // unreachable via the parser's inTableCell gate; defensive
   }
-  if (layoutDecided && useColumns && currentRowCols >= columnWidths.size()) {
-    // Row is wider than the sampled column count; extra cells are dropped.
-    LOG_DBG("TBL", "Dropping table cell beyond sampled column count (%u)", static_cast<unsigned>(columnWidths.size()));
-    return false;
+
+  // A row wider than the grid can hold never loses cells; the layout degrades.
+  if (mode == Mode::Sampling && currentRowCols >= MAX_COLS) {
+    LOG_DBG("TBL", "Row exceeds %u columns, rendering table stacked", static_cast<unsigned>(MAX_COLS));
+    switchToStacked(sink);
+  } else if (mode == Mode::Grid && !currentRowStacked && currentRowCols >= columnWidths.size()) {
+    LOG_DBG("TBL", "Row wider than sampled %u columns, rendering row stacked",
+            static_cast<unsigned>(columnWidths.size()));
+    convertCurrentRowToStacked(sink);
   }
+
   cellOpen = true;
-  pendingColSpan = static_cast<uint8_t>(std::clamp<size_t>(colSpan, 1, MAX_COLS - currentRowCols));
+  openCellStreamed = false;
+  const size_t colsLeft = currentRowCols < MAX_COLS ? MAX_COLS - currentRowCols : 1;
+  pendingColSpan = static_cast<uint8_t>(std::clamp<size_t>(colSpan, 1, colsLeft));
   return true;
 }
 
-void TableLayout::endCell(std::unique_ptr<ParsedText> text) {
+void TableLayout::endCell(std::unique_ptr<ParsedText> text, TablePageSink& sink) {
   if (!cellOpen) {
-    return;  // cell was dropped at startCell; discard its content
+    return;  // defensive: endCell without startCell
   }
   cellOpen = false;
-  if (!layoutDecided && text) {
-    sampledWords += text->size();
-  }
-  Cell cell;
-  cell.colSpan = pendingColSpan;
-  cell.text = std::move(text);
   currentRowCols += pendingColSpan;
-  currentRow.push_back(std::move(cell));
+  const size_t words = text ? text->size() : 0;
+  const bool streamedTail = openCellStreamed;
+  openCellStreamed = false;
+
+  if (mode == Mode::Sampling) {
+    // streamOpenCell forces Stacked before any streaming, so a sampled cell is
+    // always complete here.
+    sampledWords += words;
+    Cell cell;
+    cell.colSpan = pendingColSpan;
+    cell.text = std::move(text);
+    currentRow.push_back(std::move(cell));
+
+    // Bound the sample buffer mid-row as well as at row ends: without this, a
+    // single wide row of heavy cells could buffer far past the sample limit.
+    if (sampledWords >= SAMPLE_WORD_LIMIT) {
+      decideLayout();
+      flushBufferedRows(sink);
+      if (mode == Mode::Stacked) {
+        convertCurrentRowToStacked(sink);
+      } else {
+        currentRowWords = 0;
+        for (const auto& cell : currentRow) {
+          currentRowWords += cell.text ? cell.text->size() : 0;
+        }
+        // The partial row can be heavier or wider than the grid decided from
+        // the complete rows; degrade it to stacked rather than losing cells.
+        if (currentRowWords > GRID_ROW_WORD_LIMIT || currentRowCols > columnWidths.size()) {
+          convertCurrentRowToStacked(sink);
+        }
+      }
+    }
+    return;
+  }
+
+  if (mode == Mode::Grid && !currentRowStacked) {
+    // A row about to exceed the grid budget renders stacked (grid resumes with
+    // the next row); its buffered cells emit now and lose nothing.
+    if (!streamedTail && currentRowWords + words > GRID_ROW_WORD_LIMIT) {
+      LOG_DBG("TBL", "Row exceeds %u-word grid budget, rendering row stacked",
+              static_cast<unsigned>(GRID_ROW_WORD_LIMIT));
+      convertCurrentRowToStacked(sink);
+    } else if (!streamedTail) {
+      currentRowWords += words;
+      Cell cell;
+      cell.colSpan = pendingColSpan;
+      cell.text = std::move(text);
+      currentRow.push_back(std::move(cell));
+      return;
+    }
+  }
+
+  // Stacked table, degraded row, or the tail of a streamed cell: emit now.
+  if (text && !text->isEmpty()) {
+    emitStackedCell(*text, sink, true);
+  }
 }
 
 void TableLayout::endRow(TablePageSink& sink) {
   cellOpen = false;
   rowOpen = false;
-  if (currentRow.empty()) {
+  openCellStreamed = false;
+
+  if (mode == Mode::Sampling) {
+    if (!currentRow.empty()) {
+      bufferedRows.push_back(std::move(currentRow));
+      currentRow.clear();
+    }
+    if (bufferedRows.size() >= SAMPLE_ROW_LIMIT || sampledWords >= SAMPLE_WORD_LIMIT) {
+      decideLayout();
+      flushBufferedRows(sink);
+    }
     return;
   }
 
-  if (layoutDecided) {
-    emitRow(currentRow, sink);
-    currentRow.clear();
+  if (mode == Mode::Grid && !currentRowStacked) {
+    if (!currentRow.empty()) {
+      emitRow(currentRow, sink);
+      currentRow.clear();
+    }
+    currentRowWords = 0;
     return;
   }
 
-  bufferedRows.push_back(std::move(currentRow));
-  currentRow.clear();
-  if (bufferedRows.size() >= SAMPLE_ROW_LIMIT || sampledWords >= SAMPLE_WORD_LIMIT) {
-    decideLayout();
-    flushBufferedRows(sink);
+  // Stacked table or degraded grid row: cells already emitted as they closed.
+  if (stackedRowHadContent) {
+    emitStackedRowSeparator(sink);
   }
+  stackedRowHadContent = false;
+  currentRowStacked = false;
+  currentRowWords = 0;
 }
 
 void TableLayout::finish(TablePageSink& sink) {
   // Salvage a row whose </tr> never arrived.
   endRow(sink);
-  if (!layoutDecided) {
+  if (mode == Mode::Sampling) {
     decideLayout();
+    flushBufferedRows(sink);
   }
-  flushBufferedRows(sink);
   if (emittedAnything) {
     // Breathing room below the table, mirroring the gap added above it.
     if (sink.currentY() > 0 && sink.currentY() + lineHeight / 2 <= sink.pageHeight()) {
@@ -111,9 +185,47 @@ void TableLayout::finish(TablePageSink& sink) {
   }
 }
 
-void TableLayout::decideLayout() {
-  layoutDecided = true;
+void TableLayout::streamOpenCell(ParsedText& text, TablePageSink& sink) {
+  if (!cellOpen) {
+    return;
+  }
+  if (!openCellStreamed) {
+    // A streamed cell can never join a materialized grid row: degrade the
+    // affected scope to stacked BEFORE the cell's first lines hit the page,
+    // so everything renders in document order.
+    if (mode == Mode::Sampling) {
+      LOG_DBG("TBL", "Cell exceeds %u words, rendering table stacked", static_cast<unsigned>(CELL_STREAM_THRESHOLD));
+      switchToStacked(sink);
+    } else if (mode == Mode::Grid && !currentRowStacked) {
+      LOG_DBG("TBL", "Cell exceeds %u words, rendering row stacked", static_cast<unsigned>(CELL_STREAM_THRESHOLD));
+      convertCurrentRowToStacked(sink);
+    }
+    openCellStreamed = true;
+  }
+  // Flush all finished lines; the trailing partial line's words stay in `text`
+  // and keep collecting.
+  emitStackedCell(text, sink, false);
+}
 
+void TableLayout::switchToStacked(TablePageSink& sink) {
+  mode = Mode::Stacked;
+  flushBufferedRows(sink);
+  convertCurrentRowToStacked(sink);
+}
+
+void TableLayout::convertCurrentRowToStacked(TablePageSink& sink) {
+  currentRowStacked = true;
+  currentRowWords = 0;
+  for (auto& cell : currentRow) {
+    if (cell.text && !cell.text->isEmpty()) {
+      emitStackedCell(*cell.text, sink, true);
+    }
+    cell.text.reset();
+  }
+  currentRow.clear();
+}
+
+void TableLayout::decideLayout() {
   size_t numCols = 0;
   for (const auto& row : bufferedRows) {
     size_t cols = 0;
@@ -131,21 +243,22 @@ void TableLayout::decideLayout() {
                             ? static_cast<size_t>((availableWidth - BORDER) / (minColWidth + slotOverhead))
                             : 1;
   // A 1-column grid is just a boxed paragraph; render it (and anything too wide) stacked.
-  useColumns = numCols >= 2 && numCols <= maxFit;
-  if (!useColumns) {
+  if (numCols < 2 || numCols > maxFit) {
     if (numCols > maxFit) {
       LOG_DBG("TBL", "Table with %u columns too wide for viewport (%u fit), using stacked layout",
               static_cast<unsigned>(numCols), static_cast<unsigned>(maxFit));
     }
+    mode = Mode::Stacked;
     return;
   }
+  mode = Mode::Grid;
 
   // Natural (single-line) width of each column, sampled from the buffered rows.
   // Spanning cells contribute an even share to each spanned column.
   std::vector<int32_t> natural(numCols, 0);
-  for (const auto& row : bufferedRows) {
+  for (auto& row : bufferedRows) {
     size_t col = 0;
-    for (const auto& cell : row) {
+    for (auto& cell : row) {
       if (col >= numCols) break;
       const size_t span = std::min<size_t>(cell.colSpan, numCols - col);
       if (cell.text && !cell.text->isEmpty()) {
@@ -216,11 +329,21 @@ void TableLayout::flushBufferedRows(TablePageSink& sink) {
 }
 
 void TableLayout::emitRow(Row& row, TablePageSink& sink) {
-  if (useColumns) {
-    emitRowColumns(row, sink);
-  } else {
-    emitRowStacked(row, sink);
+  if (mode == Mode::Grid) {
+    // Sampled rows were buffered before the budget could apply to them; rows
+    // too heavy to materialize as grid lines render stacked, in full.
+    size_t words = 0;
+    for (const auto& cell : row) {
+      words += cell.text ? cell.text->size() : 0;
+    }
+    if (words <= GRID_ROW_WORD_LIMIT) {
+      emitRowColumns(row, sink);
+      return;
+    }
+    LOG_DBG("TBL", "Sampled row exceeds %u-word grid budget, rendering row stacked",
+            static_cast<unsigned>(GRID_ROW_WORD_LIMIT));
   }
+  emitRowStacked(row, sink);
 }
 
 void TableLayout::addRect(TablePageSink& sink, const int16_t x, const int16_t y, const uint16_t w,
@@ -235,9 +358,6 @@ void TableLayout::addRect(TablePageSink& sink, const int16_t x, const int16_t y,
   }
   sink.addElement(std::move(rect));
 }
-
-// UTF-8 for U+2026 HORIZONTAL ELLIPSIS, appended where cell content is truncated.
-constexpr const char* TRUNCATION_ELLIPSIS = "\xE2\x80\xA6";
 
 size_t TableLayout::layoutRowCells(Row& row) {
   const size_t numCols = columnWidths.size();
@@ -269,14 +389,6 @@ size_t TableLayout::layoutRowCells(Row& row) {
     rowCellLines.emplace_back();
     auto& lines = rowCellLines.back();
     if (cell.text && !cell.text->isEmpty()) {
-      // All of a row's lines are alive at once below, so bound the row's total
-      // words; spanning cells get a proportionally larger share.
-      const size_t cellBudget = std::max<size_t>(1, ROW_WORD_BUDGET * span / numCols);
-      if (cell.text->size() > cellBudget) {
-        LOG_DBG("TBL", "Truncating table cell to %u words", static_cast<unsigned>(cellBudget));
-        cell.text->truncateWords(cellBudget);
-        cell.text->addWord(TRUNCATION_ELLIPSIS, EpdFontFamily::REGULAR);
-      }
       lines.reserve(cell.text->size());
       cell.text->layoutAndExtractLines(renderer, fontId, static_cast<uint16_t>(contentWidth),
                                        [&lines](const std::shared_ptr<TextBlock>& line) { lines.push_back(line); });
@@ -341,11 +453,10 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
       closing = false;
     }
     if (fit == 0) {
-      // Degenerate page (shorter than one text line): emit a single line and
-      // drop the rest of the row rather than looping or overflowing the
-      // int16 geometry below with an unbounded forced fit.
+      // Degenerate page (shorter than one text line): emit one line per page —
+      // it may clip at the page edge, but every line still reaches a page.
       fit = 1;
-      closing = true;
+      closing = remaining == 1;
     }
 
     for (size_t i = 0; i < rowCellLines.size(); ++i) {
@@ -390,56 +501,61 @@ void TableLayout::emitRowColumns(Row& row, TablePageSink& sink) {
 }
 
 void TableLayout::emitRowStacked(Row& row, TablePageSink& sink) {
+  for (auto& cell : row) {
+    if (cell.text && !cell.text->isEmpty()) {
+      emitStackedCell(*cell.text, sink, true);
+    }
+    cell.text.reset();
+  }
+  if (stackedRowHadContent) {
+    emitStackedRowSeparator(sink);
+  }
+  stackedRowHadContent = false;
+}
+
+void TableLayout::emitStackedCell(ParsedText& text, TablePageSink& sink, const bool includeLastLine) {
   const int16_t pageH = sink.pageHeight();
   const uint16_t contentWidth =
       availableWidth > 2 * CELL_PAD_X ? static_cast<uint16_t>(availableWidth - 2 * CELL_PAD_X) : availableWidth;
   const auto contentX = static_cast<int16_t>(originX + CELL_PAD_X);
 
-  bool emittedCell = false;
-  for (auto& cell : row) {
-    if (!cell.text || cell.text->isEmpty()) {
-      cell.text.reset();
-      continue;
-    }
-
-    if (topBorderPending) {
-      // Open the table block with a gap and a full-width separator.
-      if (sink.currentY() > 0) {
-        if (sink.currentY() + lineHeight / 2 + BORDER + lineHeight > pageH) {
-          sink.completePage();
-        } else {
-          sink.advanceY(lineHeight / 2);
-        }
-      }
-      addRect(sink, originX, sink.currentY(), availableWidth, BORDER);
-      sink.advanceY(static_cast<int16_t>(BORDER + lineHeight / 4));
-      topBorderPending = false;
-    }
-
-    cell.text->layoutAndExtractLines(renderer, fontId, contentWidth, [&](const std::shared_ptr<TextBlock>& line) {
-      if (sink.currentY() + lineHeight > pageH) {
+  if (topBorderPending) {
+    // Open the table block with a gap and a full-width separator.
+    if (sink.currentY() > 0) {
+      if (sink.currentY() + lineHeight / 2 + BORDER + lineHeight > pageH) {
         sink.completePage();
+      } else {
+        sink.advanceY(lineHeight / 2);
       }
-      auto pageLine = std::shared_ptr<PageLine>(new (std::nothrow) PageLine(line, contentX, sink.currentY()));
-      if (!pageLine) {
-        LOG_ERR("TBL", "OOM: PageLine");
-        return;
-      }
-      sink.addElement(std::move(pageLine));
-      sink.advanceY(lineHeight);
-      emittedCell = true;
-    });
-    cell.text.reset();
+    }
+    addRect(sink, originX, sink.currentY(), availableWidth, BORDER);
+    sink.advanceY(static_cast<int16_t>(BORDER + lineHeight / 4));
+    topBorderPending = false;
   }
 
-  if (!emittedCell) {
-    return;
-  }
-  emittedAnything = true;
+  text.layoutAndExtractLines(
+      renderer, fontId, contentWidth,
+      [this, &sink, contentX, pageH](const std::shared_ptr<TextBlock>& line) {
+        if (sink.currentY() + lineHeight > pageH) {
+          sink.completePage();
+        }
+        auto pageLine = std::shared_ptr<PageLine>(new (std::nothrow) PageLine(line, contentX, sink.currentY()));
+        if (!pageLine) {
+          LOG_ERR("TBL", "OOM: PageLine");
+          return;
+        }
+        sink.addElement(std::move(pageLine));
+        sink.advanceY(lineHeight);
+        stackedRowHadContent = true;
+        emittedAnything = true;
+      },
+      includeLastLine);
+}
 
+void TableLayout::emitStackedRowSeparator(TablePageSink& sink) {
   // Thin separator under the row (skipped when the page break already separates).
   const auto sepGap = static_cast<int16_t>(lineHeight / 4);
-  if (sink.currentY() > 0 && sink.currentY() + 2 * sepGap + BORDER <= pageH) {
+  if (sink.currentY() > 0 && sink.currentY() + 2 * sepGap + BORDER <= sink.pageHeight()) {
     sink.advanceY(sepGap);
     addRect(sink, originX, sink.currentY(), availableWidth, BORDER);
     sink.advanceY(static_cast<int16_t>(BORDER + sepGap));

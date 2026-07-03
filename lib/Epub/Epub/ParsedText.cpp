@@ -571,18 +571,6 @@ void ParsedText::measureIntrinsicWidths(const GfxRenderer& renderer, const int f
   }
 }
 
-void ParsedText::truncateWords(const size_t maxWords) {
-  if (words.size() <= maxWords) {
-    return;
-  }
-  words.resize(maxWords);
-  wordStyles.resize(maxWords);
-  wordContinues.resize(maxWords);
-  wordNoSpaceBefore.resize(maxWords);
-  wordIsFocusSuffix.resize(maxWords);
-  cachedWordWidths.clear();
-}
-
 std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& renderer, const int fontId) {
   std::vector<uint16_t> wordWidths;
   wordWidths.reserve(words.size());

@@ -78,6 +78,4 @@ class ParsedText {
   // Used by table layout to derive column widths from cell content. The per-word
   // widths are cached and reused by the next layoutAndExtractLines call.
   void measureIntrinsicWidths(const GfxRenderer& renderer, int fontId, int& naturalWidth, int& maxWordWidth);
-  // Drops all words beyond maxWords (table cell truncation). No-op when already smaller.
-  void truncateWords(size_t maxWords);
 };
